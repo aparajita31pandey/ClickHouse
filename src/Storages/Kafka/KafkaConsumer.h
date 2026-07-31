@@ -37,7 +37,8 @@ public:
         bool intermediate_commit_,
         const std::atomic<bool> & stopped_,
         const Names & _topics,
-        size_t skip_bytes_ = 0
+        size_t skip_bytes_ = 0,
+        std::optional<std::vector<Int32>> sticky_partitions_ = std::nullopt
     );
 
     ~KafkaConsumer() override;
@@ -154,6 +155,12 @@ private:
     std::optional<cppkafka::TopicPartitionList> assignment;
     const Names topics;
 
+    /// When set, partitions are pinned to this consumer via client-side assign() instead of
+    /// consumer-group subscribe() (kafka_partition_assignment = 'shard_sticky'). No group
+    /// rebalancing happens in this mode; offsets are still committed to the consumer group.
+    /// May hold an empty list: the consumer then owns nothing and polls no data.
+    const std::optional<std::vector<Int32>> sticky_partitions;
+
     /// Offset of the first message of the current, not-yet-durably-committed block
     cppkafka::TopicPartitionList block_start_offsets;
 
@@ -178,6 +185,9 @@ private:
     void cleanUnprocessed();
     void cleanAssignment();
     void resetIfStopped();
+    /// subscribe() delegates here in sticky mode: assigns sticky_partitions of all topics
+    /// to the consumer without joining a consumer group.
+    void assignViaSticky();
     ReadBufferPtr getNextMessage();
     void trackCurrentBlockStart(const cppkafka::Message & message);
 };

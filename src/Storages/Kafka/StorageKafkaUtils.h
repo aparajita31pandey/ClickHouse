@@ -66,6 +66,10 @@ struct ConsumerStatistics // system.kafka_consumers data
 };
 
 Names parseTopics(String topic_list);
+/// Parses a comma-separated list of Kafka partition ids (e.g. "0,1,2,3") used for
+/// sticky partition-to-shard assignment. Throws BAD_ARGUMENTS on malformed input,
+/// negative or duplicate partitions. An empty string yields an empty list.
+std::vector<Int32> parseShardPartitions(String partitions_list);
 String getDefaultClientId(const StorageID & table_id);
 
 using ErrorHandler = std::function<void(const cppkafka::Error &)>;

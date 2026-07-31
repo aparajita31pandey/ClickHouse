@@ -3,6 +3,8 @@
 
 #include <Core/Settings.h>
 #include <Core/UUID.h>
+#include <IO/ReadBufferFromString.h>
+#include <IO/ReadHelpers.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeDateTime64.h>
@@ -38,6 +40,8 @@
 
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim.hpp>
+
+#include <algorithm>
 
 #include <cppkafka/cppkafka.h>
 #include <librdkafka/rdkafka.h>
@@ -76,6 +80,7 @@ namespace KafkaSetting
     extern const KafkaSettingsUInt64 kafka_max_block_size;
     extern const KafkaSettingsUInt64 kafka_max_rows_per_message;
     extern const KafkaSettingsUInt64 kafka_num_consumers;
+    extern const KafkaSettingsString kafka_partition_assignment;
     extern const KafkaSettingsUInt64 kafka_poll_max_batch_size;
     extern const KafkaSettingsMilliseconds kafka_poll_timeout_ms;
     extern const KafkaSettingsString kafka_replica_name;
@@ -91,6 +96,7 @@ using namespace std::chrono_literals;
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int NOT_IMPLEMENTED;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
     extern const int SUPPORT_IS_DISABLED;
 }
@@ -249,6 +255,12 @@ void registerStorageKafka(StorageFactory & factory)
 
         const auto has_keeper_path = (*kafka_settings)[KafkaSetting::kafka_keeper_path].changed && !(*kafka_settings)[KafkaSetting::kafka_keeper_path].value.empty();
         const auto has_replica_name = (*kafka_settings)[KafkaSetting::kafka_replica_name].changed && !(*kafka_settings)[KafkaSetting::kafka_replica_name].value.empty();
+
+        if ((has_keeper_path || has_replica_name) && (*kafka_settings)[KafkaSetting::kafka_partition_assignment].value == "shard_sticky")
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "kafka_partition_assignment = 'shard_sticky' is not supported together with Keeper-based offset storage "
+                "(kafka_keeper_path / kafka_replica_name)");
 
         if (!has_keeper_path && !has_replica_name)
             return std::make_shared<StorageKafka>(
@@ -843,6 +855,38 @@ Names parseTopics(String topic_list)
     boost::split(result, topic_list, [](char c) { return c == ','; });
     for (String & topic : result)
         boost::trim(topic);
+    return result;
+}
+
+std::vector<Int32> parseShardPartitions(String partitions_list)
+{
+    std::vector<Int32> result;
+
+    boost::trim(partitions_list);
+    if (partitions_list.empty())
+        return result;
+
+    Names tokens;
+    boost::split(tokens, partitions_list, [](char c) { return c == ','; });
+
+    for (String & token : tokens)
+    {
+        boost::trim(token);
+
+        Int32 partition;
+        ReadBufferFromString buf(token);
+        if (token.empty() || !tryReadIntText(partition, buf) || !buf.eof() || partition < 0)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Invalid partition '{}' in 'kafka_shard_partitions'. Expected a comma-separated list of non-negative integers, e.g. '0,1,2,3'",
+                token);
+
+        if (std::find(result.begin(), result.end(), partition) != result.end())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Duplicate partition {} in 'kafka_shard_partitions'", partition);
+
+        result.push_back(partition);
+    }
+
     return result;
 }
 

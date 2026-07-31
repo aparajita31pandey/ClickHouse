@@ -127,6 +127,14 @@ private:
     const size_t max_rows_per_message;
     const String schema_name;
     const size_t num_consumers; /// total number of consumers
+    /// kafka_partition_assignment = 'shard_sticky': partitions from kafka_shard_partitions are
+    /// pinned to this shard via client-side assign() (no consumer group rebalancing).
+    const bool sticky_partition_assignment;
+    /// Partitions owned by this shard (parsed kafka_shard_partitions); empty unless sticky.
+    const std::vector<Int32> shard_partitions;
+    /// kafka_replica_consume_mode = 'redundant': every consumer reads all shard partitions
+    /// instead of splitting them round-robin (cooperative_split).
+    const bool redundant_replica_consume;
     LoggerPtr log;
     const bool intermediate_commit;
     const SettingsChanges settings_adjustments;

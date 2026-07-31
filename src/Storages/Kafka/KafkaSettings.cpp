@@ -6,6 +6,7 @@
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTSetQuery.h>
 #include <Storages/Kafka/KafkaSettings.h>
+#include <Storages/Kafka/StorageKafkaUtils.h>
 #include <Common/Exception.h>
 #include <Common/NamedCollections/NamedCollections.h>
 
@@ -56,6 +57,9 @@ namespace ErrorCodes
     DECLARE(Milliseconds, kafka_consumer_acquire_timeout_ms, 30000, "Timeout in milliseconds for acquiring a Kafka consumer during direct SELECT queries. When multiple concurrent direct SELECTs run on the same Kafka2 table, each query must wait for consumers to become available. A timeout is needed to break potential deadlocks when queries hold different subsets of consumers.", 0) \
     DECLARE(Bool, kafka_map_virtual_columns_on_write, false, "If enabled, columns with special names (`_key`, `_timestamp`, `_headers.name`, `_headers.value`) in the Kafka table are mapped to the corresponding Kafka message metadata on INSERT and are excluded from the message payload.", 0) \
     DECLARE(String, kafka_aws_region, "", "AWS region for MSK IAM authentication. Auto-detected from broker address if not specified. Required for PrivateLink or custom DNS.", 0) \
+    DECLARE(String, kafka_partition_assignment, "", "Partition assignment strategy. Empty (default) uses broker-managed consumer group rebalancing (subscribe()). 'shard_sticky' pins the partitions from kafka_shard_partitions to this shard via client-side assign(), avoiding group rebalances entirely.", 0) \
+    DECLARE(String, kafka_shard_partitions, "", "Comma-separated list of partitions owned by this shard, e.g. '0,1,2,3'. Applies to every topic in kafka_topic_list. Requires kafka_partition_assignment = 'shard_sticky'.", 0) \
+    DECLARE(String, kafka_replica_consume_mode, "cooperative_split", "How consumers of one table split the shard-owned partitions: 'cooperative_split' distributes them round-robin across kafka_num_consumers (each partition is read by exactly one consumer), 'redundant' makes every consumer read all shard partitions. Only used with kafka_partition_assignment = 'shard_sticky'.", 0) \
 
 #define OBSOLETE_KAFKA_SETTINGS(M, ALIAS) \
     MAKE_OBSOLETE(M, Char, kafka_row_delimiter, '\0') \
@@ -141,6 +145,34 @@ void KafkaSettings::sanityCheck(ContextPtr global_context) const
         && !global_context->getDeadLetterQueue())
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
                         "The table system.dead_letter_queue is not configured on the server. You cannot create a table with this `kafka_handle_error_mode`.");
+
+    const auto & partition_assignment = (*impl)[KafkaSetting::kafka_partition_assignment].value;
+    if (!partition_assignment.empty() && partition_assignment != "shard_sticky")
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Invalid value '{}' for 'kafka_partition_assignment'. Supported values: '' (broker-managed rebalancing), 'shard_sticky'",
+            partition_assignment);
+
+    if (partition_assignment == "shard_sticky" && (*impl)[KafkaSetting::kafka_shard_partitions].value.empty())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "'kafka_partition_assignment' is set to 'shard_sticky', but 'kafka_shard_partitions' is empty. "
+            "Specify the partitions owned by this shard, e.g. '0,1,2,3'");
+
+    if (partition_assignment.empty() && !(*impl)[KafkaSetting::kafka_shard_partitions].value.empty())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "'kafka_shard_partitions' has no effect unless 'kafka_partition_assignment' is set to 'shard_sticky'");
+
+    /// Throws BAD_ARGUMENTS on non-numeric or duplicate partitions
+    StorageKafkaUtils::parseShardPartitions((*impl)[KafkaSetting::kafka_shard_partitions].value);
+
+    const auto & replica_consume_mode = (*impl)[KafkaSetting::kafka_replica_consume_mode].value;
+    if (replica_consume_mode != "cooperative_split" && replica_consume_mode != "redundant")
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Invalid value '{}' for 'kafka_replica_consume_mode'. Supported values: 'cooperative_split', 'redundant'",
+            replica_consume_mode);
 }
 
 SettingsChanges KafkaSettings::getFormatSettings() const

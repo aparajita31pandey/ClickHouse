@@ -51,7 +51,8 @@ KafkaConsumer::KafkaConsumer(
     bool intermediate_commit_,
     const std::atomic<bool> & stopped_,
     const Names & _topics,
-    size_t skip_bytes_)
+    size_t skip_bytes_,
+    std::optional<std::vector<Int32>> sticky_partitions_)
     : log(log_)
     , batch_size(max_batch_size)
     , poll_timeout(poll_timeout_)
@@ -60,6 +61,7 @@ KafkaConsumer::KafkaConsumer(
     , stopped(stopped_)
     , current(messages.begin())
     , topics(_topics)
+    , sticky_partitions(std::move(sticky_partitions_))
     , exceptions_buffer(EXCEPTIONS_DEPTH)
 {
 }
@@ -286,6 +288,12 @@ void KafkaConsumer::subscribe()
     if (stalled_status != CONSUMER_STOPPED)
         stalled_status = NO_MESSAGES_RETURNED;
 
+    if (sticky_partitions.has_value())
+    {
+        assignViaSticky();
+        return;
+    }
+
     auto subscription = consumer->get_subscription();
 
     if (!subscription.empty())
@@ -354,6 +362,58 @@ void KafkaConsumer::subscribe()
     current_subscription_valid = true;
 
     // Immediately poll for messages (+callbacks) after successful subscription.
+    doPoll();
+}
+
+void KafkaConsumer::assignViaSticky()
+{
+    if (current_subscription_valid && assignment.has_value())
+    {
+        LOG_TRACE(log, "Already sticky-assigned to: {}", assignment.value());
+        return;
+    }
+
+    if (stopped)
+    {
+        LOG_TRACE(log, "Consumer is stopped; cannot assign partitions.");
+        return;
+    }
+
+    cppkafka::TopicPartitionList topic_partitions;
+    topic_partitions.reserve(topics.size() * sticky_partitions->size());
+    for (const auto & topic : topics)
+        for (const auto partition : *sticky_partitions)
+            /// Default TopicPartition offset is OFFSET_INVALID: librdkafka resumes from the offset
+            /// committed for the consumer group, falling back to auto.offset.reset. Offsets keep
+            /// being committed to the group even though no group membership is established.
+            topic_partitions.emplace_back(topic, partition);
+
+    LOG_TRACE(log, "Sticky-assigning topics/partitions (no consumer group join): {}", topic_partitions);
+
+    try
+    {
+        consumer->assign(topic_partitions);
+    }
+    catch (const cppkafka::HandleException & e)
+    {
+        LOG_ERROR(log, "Exception during assign: {}", e.what());
+        setExceptionInfo(e.what(), /* with_stacktrace = */ true);
+        throw;
+    }
+
+    /// The assignment callback is only invoked on group rebalances, which never happen with
+    /// manual assign(), so track the assignment and metrics here.
+    cleanAssignment();
+    assignment = topic_partitions;
+    CurrentMetrics::add(CurrentMetrics::KafkaAssignedPartitions, topic_partitions.size());
+    if (topic_partitions.empty())
+        LOG_INFO(log, "Empty sticky assignment: this consumer owns no partitions (more consumers than partitions in kafka_shard_partitions?)");
+    else
+        CurrentMetrics::add(CurrentMetrics::KafkaConsumersWithAssignment, 1);
+
+    current_subscription_valid = true;
+
+    // Immediately poll for messages after successful assignment.
     doPoll();
 }
 

@@ -28,6 +28,7 @@
 #include <Storages/StorageMaterializedView.h>
 #include <Storages/StreamingStorageRegistry.h>
 #include <cppkafka/configuration.h>
+#include <fmt/ranges.h>
 #include <librdkafka/rdkafka.h>
 #include <Poco/Util/AbstractConfiguration.h>
 #include <Common/Exception.h>
@@ -90,10 +91,13 @@ namespace KafkaSetting
     extern const KafkaSettingsBool kafka_map_virtual_columns_on_write;
     extern const KafkaSettingsUInt64 kafka_max_rows_per_message;
     extern const KafkaSettingsUInt64 kafka_num_consumers;
+    extern const KafkaSettingsString kafka_partition_assignment;
     extern const KafkaSettingsUInt64 kafka_poll_max_batch_size;
     extern const KafkaSettingsMilliseconds kafka_poll_timeout_ms;
+    extern const KafkaSettingsString kafka_replica_consume_mode;
     extern const KafkaSettingsString kafka_schema;
     extern const KafkaSettingsUInt64 kafka_schema_registry_skip_bytes;
+    extern const KafkaSettingsString kafka_shard_partitions;
     extern const KafkaSettingsBool kafka_thread_per_consumer;
     extern const KafkaSettingsString kafka_topic_list;
 }
@@ -189,6 +193,9 @@ StorageKafka::StorageKafka(
     , max_rows_per_message((*kafka_settings)[KafkaSetting::kafka_max_rows_per_message].value)
     , schema_name(getContext()->getMacros()->expand((*kafka_settings)[KafkaSetting::kafka_schema].value, macros_info))
     , num_consumers((*kafka_settings)[KafkaSetting::kafka_num_consumers].value)
+    , sticky_partition_assignment((*kafka_settings)[KafkaSetting::kafka_partition_assignment].value == "shard_sticky")
+    , shard_partitions(StorageKafkaUtils::parseShardPartitions((*kafka_settings)[KafkaSetting::kafka_shard_partitions].value))
+    , redundant_replica_consume((*kafka_settings)[KafkaSetting::kafka_replica_consume_mode].value == "redundant")
     , log(getLogger("StorageKafka (" + table_id_.getFullTableName() + ")"))
     , intermediate_commit((*kafka_settings)[KafkaSetting::kafka_commit_every_batch].value)
     , settings_adjustments(StorageKafkaUtils::createSettingsAdjustments(*kafka_settings, schema_name))
@@ -493,6 +500,24 @@ KafkaConsumerPtr StorageKafka::createKafkaConsumer(size_t consumer_number)
     /// NOTE: we pass |stream_cancelled| by reference here, so the buffers should not outlive the storage.
     auto & stream_cancelled = thread_per_consumer ? tasks[consumer_number]->stream_cancelled : tasks.back()->stream_cancelled;
 
+    std::optional<std::vector<Int32>> sticky_partitions;
+    if (sticky_partition_assignment)
+    {
+        sticky_partitions.emplace();
+        if (redundant_replica_consume)
+        {
+            *sticky_partitions = shard_partitions;
+        }
+        else
+        {
+            /// cooperative_split: round-robin the shard-owned partitions across consumers,
+            /// so each partition is read by exactly one consumer of this table.
+            for (size_t i = consumer_number; i < shard_partitions.size(); i += num_consumers)
+                sticky_partitions->push_back(shard_partitions[i]);
+        }
+        LOG_DEBUG(log, "Consumer #{} sticky partitions: [{}]", consumer_number, fmt::join(*sticky_partitions, ", "));
+    }
+
     KafkaConsumerPtr kafka_consumer_ptr = std::make_shared<KafkaConsumer>(
         log,
         getPollMaxBatchSize(),
@@ -500,7 +525,8 @@ KafkaConsumerPtr StorageKafka::createKafkaConsumer(size_t consumer_number)
         intermediate_commit,
         stream_cancelled,
         topics,
-        getSchemaRegistrySkipBytes());
+        getSchemaRegistrySkipBytes(),
+        std::move(sticky_partitions));
     return kafka_consumer_ptr;
 }
 cppkafka::Configuration StorageKafka::getConsumerConfiguration(size_t consumer_number, IKafkaExceptionInfoSinkPtr exception_info_sink_ptr)
