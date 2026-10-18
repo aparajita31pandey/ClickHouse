@@ -1321,6 +1321,21 @@ The replica name in ZooKeeper.
     DECLARE(Bool, enable_azure_sdk_logging, false, R"(Enables logging from Azure sdk)", 0) \
     DECLARE(Bool, s3queue_disable_streaming, false, "Disable streaming in S3Queue even if the table is created and there are attached materiaized views", 0) \
     DECLARE(Bool, message_queue_disable_insertion, false, "Disable insertion from message queue engines (Kafka, RabbitMQ, NATS) into attached materialized views", 0) \
+    DECLARE(UInt64, stream_kafka_locks_refresh_polls, 15, R"(
+Number of extra poll cycles a Keeper-backed Kafka consumer (`StorageKafka2`) keeps its current
+topic-partition assignment before doing a full Keeper round to refresh its locks and rebalance.
+
+Lowering it makes a replica pick up partitions released by a dead replica sooner, at the cost of
+more Keeper and Kafka metadata traffic from every consumer on the server. Raising it reduces that
+traffic but slows rebalancing down.
+
+`0` refreshes on every poll cycle. That removes the amortisation and can collapse consumer
+throughput, because each cycle discards already prefetched messages and restarts fetching from the
+committed offsets.
+
+Applied without a restart on `SYSTEM RELOAD CONFIG`. Only affects tables created with
+`kafka_keeper_path` and `kafka_replica_name`; the original Kafka engine ignores it.
+)", 0) \
     DECLARE(UInt64, max_entries_for_hash_table_stats, 10'000, R"(How many entries hash table statistics collected during aggregation is allowed to have)", 0) \
     DECLARE(String, merge_workload, "default", R"(
 Used to regulate how resources are utilized and shared between merges and other workloads. Specified value is used as `workload` setting value for all background merges. Can be overridden by a merge tree setting.
@@ -3817,6 +3832,8 @@ ChangeableSettingsMap collectChangeableServerSettings(ContextPtr context)
             {"s3queue_disable_streaming",
              {std::to_string(context->getServerSettingsCopy().get("s3queue_disable_streaming").safeGet<bool>()), ChangeableWithoutRestart::Yes}},
             {"message_queue_disable_insertion", {std::to_string(context->getMessageQueueDisableInsertion()), ChangeableWithoutRestart::No}},
+            {"stream_kafka_locks_refresh_polls",
+             {std::to_string(context->getKafkaLocksRefreshPolls()), ChangeableWithoutRestart::Yes}},
             {"enable_read_through_distributed_cache", {std::to_string(context->getReadThroughDistributedCache()), ChangeableWithoutRestart::Yes}},
             {"enable_write_through_distributed_cache", {std::to_string(context->getWriteThroughDistributedCache()), ChangeableWithoutRestart::Yes}},
 
