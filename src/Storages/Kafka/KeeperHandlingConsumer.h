@@ -4,6 +4,7 @@
 #include <mutex>
 #include <IO/ReadBuffer.h>
 #include <Storages/Kafka/KafkaConsumer2.h>
+#include <Storages/Kafka/KafkaTemporaryLocksPolicy.h>
 #include <Storages/Kafka/StorageKafkaUtils.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 
@@ -82,8 +83,11 @@ public:
         size_t idx_,
         const LoggerPtr & log_,
         size_t num_consumers_,
+        ConsumerLocksRegistryPtr locks_registry_,
         UInt64 partition_shard_num_ = 0,
         UInt64 shard_count_ = 0);
+
+    ~KeeperHandlingConsumer();
 
     /// It is important that the consumer is using the same Keeper session as the storage to make sure all ephemeral
     /// nodes are handled at the same time, e.g.: if a replica is deactivated because of session loss, all of its
@@ -134,6 +138,9 @@ private:
 
     struct LockedTopicPartitionInfo
     {
+        /// Only for temporary locks taken while every active replica holds locks. Declared before `lock`, so the lock
+        /// node is removed before the slot can be given to another consumer.
+        std::optional<TemporaryLockSlots::Slot> slot;
         zkutil::EphemeralNodeHolderPtr lock;
         std::optional<int64_t> committed_offset;
         std::optional<uint64_t> intent_size;
@@ -145,12 +152,6 @@ private:
     using TopicPartitionSet
         = std::unordered_set<TopicPartition, KafkaConsumer2::TopicPartitionHash, KafkaConsumer2::TopicPartitionEquality>;
 
-    struct ActiveReplicasInfo
-    {
-        UInt64 active_replica_count{0};
-        bool has_replica_without_locks{false};
-    };
-
     std::filesystem::path keeper_path;
     const String replica_name;
     const size_t idx;
@@ -158,6 +159,9 @@ private:
     /// Consumers configured on this node (`kafka_num_consumers`). Fixed for the lifetime of
     /// the storage; used to split the node's lock quota. See `computeConsumerQuota`.
     const size_t num_consumers;
+
+    /// Shared with the other consumers of the storage on this replica, see `ConsumerLocksRegistry`. Must not be null.
+    const ConsumerLocksRegistryPtr locks_registry;
 
     /// Partition affinity settings (enabled when shard_count > 0)
     UInt64 partition_shard_num = 0;
@@ -178,6 +182,8 @@ private:
 
     // Quota, how many temporary locks can be taken in current round
     size_t tmp_locks_quota{};
+    // Consecutive rounds in which another consumer was below its permanent quota, see `computeTemporaryLocksQuota`
+    size_t rounds_with_consumer_below_quota{};
 
     std::atomic<UInt64> last_poll_timestamp = 0;
     std::atomic<UInt64> last_commit_timestamp = 0;
@@ -190,14 +196,16 @@ private:
     /// index so all consumers' quotas sum to exactly node_quota.
     size_t computeConsumerQuota(size_t node_quota) const;
 
-    std::pair<TopicPartitionSet, ActiveReplicasInfo> getLockedTopicPartitions();
-    ActiveReplicasInfo getActiveReplicasInfo(const std::unordered_set<String> & replicas_with_lock);
-    std::pair<TopicPartitions, ActiveReplicasInfo> getAvailableTopicPartitions(const TopicPartitionOffsets & all_topic_partitions);
+    std::pair<TopicPartitionSet, ReplicaLocksSummary> getLockedTopicPartitions(size_t topic_partitions_count);
+    ReplicaLocksSummary getReplicaLocksSummary(const std::unordered_map<String, size_t> & lock_count_by_replica, size_t topic_partitions_count);
+    std::pair<TopicPartitions, ReplicaLocksSummary> getAvailableTopicPartitions(const TopicPartitionOffsets & all_topic_partitions);
     std::optional<LockedTopicPartitionInfo> createLocksInfoIfFree(const TopicPartition & partition_to_lock);
 
     LockedTopicPartitionInfo & getTopicPartitionLockLocked(const TopicPartition & topic_partition) TSA_REQUIRES(topic_partition_locks_mutex);
-    void updatePermanentLocksLocked(const TopicPartitions & available_topic_partitions, size_t topic_partitions_count, size_t active_replica_count) TSA_REQUIRES(topic_partition_locks_mutex);
-    void lockTemporaryLocksLocked(const TopicPartitions & available_topic_partitions, bool has_replica_without_locks) TSA_REQUIRES(topic_partition_locks_mutex);
+    /// Returns the permanent quota of the consumer.
+    size_t updatePermanentLocksLocked(const TopicPartitions & available_topic_partitions, size_t node_quota, size_t active_replica_count) TSA_REQUIRES(topic_partition_locks_mutex);
+    void lockTemporaryLocksLocked(const TopicPartitions & available_topic_partitions, const ReplicaLocksSummary & replica_locks, size_t node_quota)
+        TSA_REQUIRES(topic_partition_locks_mutex);
 
     void rollbackToCommittedOffsets();
     /// Callable while an exception is propagating, where a throw would terminate the server.

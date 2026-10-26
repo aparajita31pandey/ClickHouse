@@ -596,12 +596,24 @@ void StorageKafka2::startup()
         /// when individual creations fail. Compacting via `push_back` would shift indices and break
         /// the per-slot streaming task in `threadFunc`, which is scheduled by the configured slot index.
         consumers.resize(num_consumers);
+        /// Shared by the consumers of this replica: Keeper only tells which replica holds a lock, and the temporary locks of
+        /// the replica are limited without a race between its consumers. See `ConsumerLocksRegistry`.
+        auto locks_registry = std::make_shared<ConsumerLocksRegistry>(num_consumers);
         for (size_t i = 0; i < num_consumers; ++i)
         {
             try
             {
                 consumers[i] = std::make_shared<KeeperHandlingConsumer>(
-                    createKafkaConsumer(i), getZooKeeper(), fs_keeper_path, replica_name, i, log, num_consumers, partition_shard_num, shard_count);
+                    createKafkaConsumer(i),
+                    getZooKeeper(),
+                    fs_keeper_path,
+                    replica_name,
+                    i,
+                    log,
+                    num_consumers,
+                    locks_registry,
+                    partition_shard_num,
+                    shard_count);
                 ++num_created_consumers;
             }
             catch (const cppkafka::Exception &)

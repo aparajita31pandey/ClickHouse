@@ -2,6 +2,7 @@
 
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
+#include <base/EnumReflection.h>
 #include <boost/algorithm/string/join.hpp>
 #include <pcg-random/pcg_random.hpp>
 #include <Common/DateLUT.h>
@@ -115,12 +116,14 @@ KeeperHandlingConsumer::KeeperHandlingConsumer(
     size_t idx_,
     const LoggerPtr & log_,
     size_t num_consumers_,
+    ConsumerLocksRegistryPtr locks_registry_,
     UInt64 partition_shard_num_,
     UInt64 shard_count_)
     : keeper_path(keeper_path_)
     , replica_name(replica_name_)
     , idx(idx_)
     , num_consumers(std::max<size_t>(num_consumers_, 1))
+    , locks_registry(std::move(locks_registry_))
     , partition_shard_num(partition_shard_num_)
     , shard_count(shard_count_)
     , kafka_consumer(kafka_consumer_)
@@ -129,6 +132,14 @@ KeeperHandlingConsumer::KeeperHandlingConsumer(
 {
     if (!keeper)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "KeeperHandlingConsumer requires a valid ZooKeeper instance");
+    if (!locks_registry)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "KeeperHandlingConsumer requires a valid ConsumerLocksRegistry");
+    locks_registry->addConsumer(idx);
+}
+
+KeeperHandlingConsumer::~KeeperHandlingConsumer()
+{
+    locks_registry->removeConsumer(idx);
 }
 
 bool KeeperHandlingConsumer::needsNewKeeper() const
@@ -145,8 +156,10 @@ void KeeperHandlingConsumer::setKeeper(const std::shared_ptr<zkutil::ZooKeeper> 
         permanent_locks.clear();
         tmp_locks.clear();
     }
+    locks_registry->forgetPermanentLocks(idx);
     keeper = keeper_;
     tmp_locks_quota = 0;
+    rounds_with_consumer_below_quota = 0;
     assigned_topic_partitions.clear();
     topic_partition_index_to_consume_from = 0;
     poll_count = 0;
@@ -203,7 +216,7 @@ std::optional<KeeperHandlingConsumer::CannotPollReason> KeeperHandlingConsumer::
         }
     }
 
-    const auto [available_topic_partitions, active_replicas_info] = getAvailableTopicPartitions(all_topic_partitions);
+    const auto [available_topic_partitions, replica_locks] = getAvailableTopicPartitions(all_topic_partitions);
     /// The fast path above lets the next cycle poll on any non-empty assignment, so from here on the
     /// assignment must be left either rewound to the committed offsets or empty.
     try
@@ -211,8 +224,11 @@ std::optional<KeeperHandlingConsumer::CannotPollReason> KeeperHandlingConsumer::
         {
             std::lock_guard lock(topic_partition_locks_mutex);
             // These operations are expected to be fast, because they only modify in-memory data and read/write to Keeper. For huge number of topic partitions
-            updatePermanentLocksLocked(available_topic_partitions, all_topic_partitions.size(), active_replicas_info.active_replica_count);
-            lockTemporaryLocksLocked(available_topic_partitions, active_replicas_info.has_replica_without_locks);
+            const size_t node_quota = computeNodeQuota(all_topic_partitions.size(), replica_locks.active_replica_count);
+            const size_t permanent_quota
+                = updatePermanentLocksLocked(available_topic_partitions, node_quota, replica_locks.active_replica_count);
+            locks_registry->reportPermanentLocks(idx, permanent_locks.size(), permanent_quota);
+            lockTemporaryLocksLocked(available_topic_partitions, replica_locks, node_quota);
             poll_count = 0;
 
             assigned_topic_partitions.reserve(permanent_locks.size() + tmp_locks.size());
@@ -260,17 +276,17 @@ KeeperHandlingConsumer::getTopicPartitionLockLocked(const TopicPartition & topic
 
 // We go through all the topic partitions, count the number of live replicas,
 // and see which partitions are already locked by other replicas
-std::pair<KeeperHandlingConsumer::TopicPartitionSet, KeeperHandlingConsumer::ActiveReplicasInfo>
-KeeperHandlingConsumer::getLockedTopicPartitions()
+std::pair<KeeperHandlingConsumer::TopicPartitionSet, ReplicaLocksSummary>
+KeeperHandlingConsumer::getLockedTopicPartitions(const size_t topic_partitions_count)
 {
     LOG_TRACE(log, "Starting to lookup replica's state");
     TopicPartitionSet locked_partitions;
     auto lock_nodes = keeper->getChildren(keeper_path / "topic_partition_locks");
-    std::unordered_set<String> replicas_with_lock;
+    std::unordered_map<String, size_t> lock_count_by_replica;
 
     for (const auto & lock_name : lock_nodes)
     {
-        replicas_with_lock.insert(keeper->get(keeper_path / "topic_partition_locks" / lock_name));
+        ++lock_count_by_replica[keeper->get(keeper_path / "topic_partition_locks" / lock_name)];
         auto base = lock_name.substr(0, lock_name.size() - 5); // drop ".lock"
         auto sep = base.rfind('_');
         if (sep == String::npos)
@@ -289,11 +305,11 @@ KeeperHandlingConsumer::getLockedTopicPartitions()
         already_locked_partitions_str.push_back(fmt::format("[{}:{}]", already_locks.topic, already_locks.partition_id));
     LOG_INFO(log, "Already locked topic partitions are [{}]", boost::algorithm::join(already_locked_partitions_str, ", "));
 
-    return {locked_partitions, getActiveReplicasInfo(replicas_with_lock)};
+    return {locked_partitions, getReplicaLocksSummary(lock_count_by_replica, topic_partitions_count)};
 }
 
-KeeperHandlingConsumer::ActiveReplicasInfo
-KeeperHandlingConsumer::getActiveReplicasInfo(const std::unordered_set<String> & replicas_with_lock)
+ReplicaLocksSummary KeeperHandlingConsumer::getReplicaLocksSummary(
+    const std::unordered_map<String, size_t> & lock_count_by_replica, const size_t topic_partitions_count)
 {
     const auto replica_names = keeper->getChildren(keeper_path / "replicas");
 
@@ -330,31 +346,33 @@ KeeperHandlingConsumer::getActiveReplicasInfo(const std::unordered_set<String> &
 
     auto is_active_responses = keeper->exists(is_active_paths);
 
-    size_t active_replica_count = 0;
-    size_t active_replicas_with_lock = 0;
+    Strings active_replicas;
+    active_replicas.reserve(candidates.size());
     for (size_t i = 0; i < candidates.size(); ++i)
     {
-        if (is_active_responses[i].error != Coordination::Error::ZOK)
-            continue;
-
-        ++active_replica_count;
-        if (replicas_with_lock.contains(candidates[i]))
-            ++active_replicas_with_lock;
+        if (is_active_responses[i].error == Coordination::Error::ZOK)
+            active_replicas.push_back(candidates[i]);
     }
 
-    /// Clamp to 1: our own is_active may be transiently missing, and 0 would divide by zero in
-    /// updatePermanentLocksLocked (its chassert is a no-op in the release build).
-    active_replica_count = std::max<size_t>(active_replica_count, 1);
-    LOG_TEST(log, "There are {} active replicas with lock, {} active replicas out of {} total replicas (shard_count={})",
-             active_replicas_with_lock, active_replica_count, replica_names.size(), shard_count);
-    const auto has_replica_without_locks = active_replicas_with_lock < active_replica_count;
-    return ActiveReplicasInfo{active_replica_count, has_replica_without_locks};
+    /// The active replica count is clamped to 1: our own is_active may be transiently missing, and 0 would divide by
+    /// zero in updatePermanentLocksLocked (its chassert is a no-op in the release build).
+    auto summary = summarizeReplicaLocks(active_replicas, lock_count_by_replica, replica_name, topic_partitions_count);
+    LOG_TEST(
+        log,
+        "There are {} active replicas out of {} total replicas (shard_count={}), has_replica_without_locks={}, "
+        "has_other_replica_below_quota={}",
+        summary.active_replica_count,
+        replica_names.size(),
+        shard_count,
+        summary.has_replica_without_locks,
+        summary.has_other_replica_below_quota);
+    return summary;
 }
 
-std::pair<KeeperHandlingConsumer::TopicPartitions, KeeperHandlingConsumer::ActiveReplicasInfo>
+std::pair<KeeperHandlingConsumer::TopicPartitions, ReplicaLocksSummary>
 KeeperHandlingConsumer::getAvailableTopicPartitions(const TopicPartitionOffsets & all_topic_partitions)
 {
-    const auto get_locked_partitions_res = getLockedTopicPartitions();
+    const auto get_locked_partitions_res = getLockedTopicPartitions(all_topic_partitions.size());
     const auto & already_locked_partitions = get_locked_partitions_res.first;
     TopicPartitions available_topic_partitions;
     available_topic_partitions.reserve(all_topic_partitions.size());
@@ -382,9 +400,10 @@ KeeperHandlingConsumer::createLocksInfoIfFree(const TopicPartition & partition_t
     {
         using zkutil::EphemeralNodeHolder;
         LockedTopicPartitionInfo lock_info{
-            EphemeralNodeHolder::create(lock_file_path, *keeper, replica_name),
-            getNumber(*keeper, topic_partition_path / commit_file_name),
-            getNumber(*keeper, topic_partition_path / intent_file_name)};
+            .slot = std::nullopt,
+            .lock = EphemeralNodeHolder::create(lock_file_path, *keeper, replica_name),
+            .committed_offset = getNumber(*keeper, topic_partition_path / commit_file_name),
+            .intent_size = getNumber(*keeper, topic_partition_path / intent_file_name)};
 
         LOG_TRACE(
             log,
@@ -414,68 +433,84 @@ KeeperHandlingConsumer::createLocksInfoIfFree(const TopicPartition & partition_t
 }
 
 void KeeperHandlingConsumer::lockTemporaryLocksLocked(
-    const TopicPartitions & available_topic_partitions, const bool has_replica_without_locks) TSA_REQUIRES(topic_partition_locks_mutex)
+    const TopicPartitions & available_topic_partitions, const ReplicaLocksSummary & replica_locks, const size_t node_quota)
+    TSA_REQUIRES(topic_partition_locks_mutex)
 {
-    /// There are no available topic partitions, so drop the quota to 0
-    if (available_topic_partitions.empty())
+    /// The available topic partitions were collected before this round's permanent locks were taken.
+    TopicPartitions free_topic_partitions;
+    free_topic_partitions.reserve(available_topic_partitions.size());
+    for (const auto & tp : available_topic_partitions)
+        if (!permanent_locks.contains(tp))
+            free_topic_partitions.push_back(tp);
+
+    const bool has_sibling_below_quota = locks_registry->hasOtherConsumerBelowQuota(idx);
+    const bool has_consumer_below_quota = replica_locks.has_other_replica_below_quota || has_sibling_below_quota;
+    rounds_with_consumer_below_quota = has_consumer_below_quota ? rounds_with_consumer_below_quota + 1 : 0;
+
+    auto decision = computeTemporaryLocksQuota(TemporaryLocksQuotaInput{
+        .previous_quota = tmp_locks_quota,
+        .available_topic_partitions = free_topic_partitions.size(),
+        .has_replica_without_locks = replica_locks.has_replica_without_locks,
+        .has_consumer_below_quota = has_consumer_below_quota,
+        .rounds_with_consumer_below_quota = rounds_with_consumer_below_quota,
+        .is_least_loaded_consumer = locks_registry->isLeastLoadedConsumer(idx, node_quota),
+    });
+
+    /// The slot is acquired before the lock node is created, so the replica never holds more temporary locks than slots.
+    std::optional<TemporaryLockSlots::Slot> slot;
+    if (decision.needs_slot)
     {
-        LOG_TRACE(log, "There are no available topic partitions to lock");
-        tmp_locks_quota = 0;
+        slot = locks_registry->tryAcquireTemporaryLockSlot(node_quota);
+        if (!slot)
+            decision = {.quota = 0, .reason = TemporaryLocksQuotaReason::NoTemporaryLockSlot, .needs_slot = false};
     }
-    /// We have some temporary lock quota, but there is at least one replica without locks, let's drop the quote to give
-    /// the other replica a chance to lock some partitions
-    else if (tmp_locks_quota > 0 && has_replica_without_locks)
-    {
-        LOG_TRACE(log, "There is at least one consumer without locks, won't lock any temporary locks this round");
-        tmp_locks_quota = 0;
-    }
-    /// We have some temporary lock quota, but it is greater than the number of available topic partitions, so we will
-    /// reduce the quota to give other replicas a chance to lock some partitions
-    else if (tmp_locks_quota > available_topic_partitions.size())
-    {
-        LOG_TRACE(log, "Reducing temporary locks to give other replicas a chance to lock some partitions");
-        tmp_locks_quota = std::min(tmp_locks_quota - 1, available_topic_partitions.size() - 1);
-    }
-    else
-    {
-        tmp_locks_quota = std::min(available_topic_partitions.size(), tmp_locks_quota + 1);
-    }
+    tmp_locks_quota = decision.quota;
+
     /// Logged for every round, including the ones that reset the quota, so the sequence of quotas can be followed
     LOG_INFO(
         log,
-        "The consumer can take {} temporary locks in the current round (available={}, idx={})",
+        "The consumer can take {} temporary locks in the current round (available={}, idx={}), reason: {} "
+        "(has_replica_without_locks={}, has_other_replica_below_quota={}, has_sibling_below_quota={}, "
+        "rounds_with_consumer_below_quota={}, used_temporary_lock_slots={})",
         tmp_locks_quota,
-        available_topic_partitions.size(),
-        idx);
+        free_topic_partitions.size(),
+        idx,
+        magic_enum::enum_name(decision.reason),
+        replica_locks.has_replica_without_locks,
+        replica_locks.has_other_replica_below_quota,
+        has_sibling_below_quota,
+        rounds_with_consumer_below_quota,
+        locks_registry->getUsedTemporaryLockSlots());
 
     if (tmp_locks_quota == 0)
         return;
 
-    auto available_topic_partitions_copy = available_topic_partitions;
     pcg64 generator(randomSeed());
-    std::shuffle(available_topic_partitions_copy.begin(), available_topic_partitions_copy.end(), generator);
+    std::shuffle(free_topic_partitions.begin(), free_topic_partitions.end(), generator);
 
-    for (const auto & tp : available_topic_partitions_copy)
+    for (const auto & tp : free_topic_partitions)
     {
         if (tmp_locks.size() >= tmp_locks_quota)
             break;
         auto maybe_lock = createLocksInfoIfFree(tp);
         if (!maybe_lock.has_value())
             continue;
+        /// A quota that needs a slot is exactly 1, so the loop stops after this lock.
+        maybe_lock->slot = std::move(slot);
         tmp_locks.emplace(TopicPartition(tp), std::move(*maybe_lock));
     }
+    /// If every free topic partition was locked by someone else in the meantime, `slot` is released here.
 }
 
 // If the number of locks on a replica is greater than it can hold, then we first release the partitions that we can no
 // longer hold. Otherwise, we try to lock free partitions one by one.
-void KeeperHandlingConsumer::updatePermanentLocksLocked(
-    const TopicPartitions & available_topic_partitions, const size_t topic_partitions_count, const size_t active_replica_count)
+size_t KeeperHandlingConsumer::updatePermanentLocksLocked(
+    const TopicPartitions & available_topic_partitions, const size_t node_quota, const size_t active_replica_count)
     TSA_REQUIRES(topic_partition_locks_mutex)
 {
     LOG_TRACE(log, "Starting to update permanent locks");
     chassert(active_replica_count > 0 && "There should be at least one active replica, because we are active");
 
-    const size_t node_quota = std::max<size_t>(topic_partitions_count / active_replica_count, 1);
     const size_t can_lock_partitions = computeConsumerQuota(node_quota);
 
     LOG_TRACE(
@@ -491,7 +526,7 @@ void KeeperHandlingConsumer::updatePermanentLocksLocked(
     if (can_lock_partitions == permanent_locks.size())
     {
         LOG_TRACE(log, "The number of permanent locks is equal to the number of locks that can be taken, will not update them");
-        return;
+        return can_lock_partitions;
     }
 
     if (can_lock_partitions < permanent_locks.size())
@@ -525,13 +560,12 @@ void KeeperHandlingConsumer::updatePermanentLocksLocked(
             ++i;
         }
     }
+    return can_lock_partitions;
 }
 
 size_t KeeperHandlingConsumer::computeConsumerQuota(size_t node_quota) const
 {
-    if (num_consumers <= 1)
-        return node_quota;
-    return node_quota / num_consumers + (idx < node_quota % num_consumers ? 1 : 0);
+    return DB::computeConsumerQuota(node_quota, num_consumers, idx);
 }
 
 void KeeperHandlingConsumer::rollbackToCommittedOffsets()
